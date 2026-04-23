@@ -1,0 +1,948 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <meta charset="UTF-8">
+    <title>X-Ray Hand Portal Engine UI</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            background: #000;
+            overflow: hidden;
+            font-family: 'Courier New', monospace;
+        }
+
+        #wrap {
+            position: relative;
+            width: 100vw;
+            height: 100vh;
+        }
+
+        video {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+            opacity: 0;
+        }
+
+        canvas {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+        }
+
+        #status {
+            position: absolute;
+            top: 18px;
+            left: 20px;
+            color: #00ffcc;
+            font-size: 13px;
+            letter-spacing: 3px;
+            text-shadow: 0 0 10px #00ffcc;
+            z-index: 10;
+        }
+
+        #frame-counter {
+            position: absolute;
+            top: 18px;
+            right: 20px;
+            color: #0088ff;
+            font-size: 12px;
+            letter-spacing: 2px;
+            text-shadow: 0 0 8px #0088ff;
+            z-index: 10;
+        }
+
+        #loader {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            color: #00ffcc;
+            font-size: 16px;
+            letter-spacing: 3px;
+            z-index: 20;
+            text-align: center;
+            line-height: 2;
+        }
+    </style>
+</head>
+
+<body>
+    <div id="wrap">
+        <video id="vid" autoplay playsinline muted></video>
+        <canvas id="cv"></canvas>
+        <div id="status">INITIALIZING...</div>
+        <div id="frame-counter">FRM: 0000</div>
+        <div id="loader">LOADING DUAL NEURAL ENGINE...<br><span style="font-size:12px;color:#0088ff">Hands & Pose
+                Modules</span></div>
+    </div>
+
+    <!-- MediaPipe Holistic -->
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/holistic/holistic.js" crossorigin="anonymous"></script>
+
+    <script>
+        const vid = document.getElementById('vid');
+        const cv = document.getElementById('cv');
+        const ctx = cv.getContext('2d', { willReadFrequently: true });
+        const statusEl = document.getElementById('status');
+        const frameEl = document.getElementById('frame-counter');
+        const loaderEl = document.getElementById('loader');
+
+        let W = 0, H = 0;
+        let frame = 0;
+        let portalAlpha = 0;
+        let scanY = 0;
+        let sparkBurst = [];
+        let streamParticles = [];
+        let dataPackets = [];
+        // --- MATH OPTIMIZATION LUTs ---
+        const RAND_LUT = new Float32Array(5000);
+        for (let i = 0; i < 5000; i++) RAND_LUT[i] = Math.random();
+        const SIN_LUT = new Float32Array(1024);
+        for (let i = 0; i < 1024; i++) SIN_LUT[i] = Math.sin((i / 1024) * Math.PI * 2);
+        let glitchUntil = 0;
+        let lastChestPos = { x: 0, y: 0 };
+        let bodyDelta = { x: 0, y: 0 };
+        let hudPos = { x: 0, y: 0 };
+        let lerpPortal = { x: 0, y: 0, w: 0, h: 0 };
+
+        for (let i = 0; i < 3; i++) {
+            dataPackets.push({ yOff: 0.1 + Math.random() * 0.8, xBase: Math.random(), w: 30 + Math.random() * 50, spd: 0.005 + Math.random() * 0.015 });
+        }
+
+        // --- NEW NEURAL BODY SYSTEM ---
+        function getParticleColor(zone, age) {
+            const palettes = [
+                ['#ffffff', '#ccffff', '#88ffff'],  // 0: head
+                ['#ff4488', '#ff0055', '#ff88bb'],  // 1: chest/torso
+                ['#00ffcc', '#00ff88', '#44ffaa'],  // 2: arms
+                ['#ffffff', '#ffff88', '#ffcc00'],  // 3: hands
+                ['#8844ff', '#aa66ff', '#cc99ff'],  // 4: hips/core
+                ['#0088ff', '#0044ff', '#44aaff'],  // 5: legs
+                ['#ff8800', '#ffaa00', '#ffcc44'],  // 6: feet
+            ];
+            const p = palettes[zone % palettes.length];
+            return p[Math.floor(age * 0.05) % p.length];
+        }
+
+        class BodyParticle {
+            constructor() {
+                this.reset();
+                this.life = Math.random();
+                this.age = Math.random() * 100;
+            }
+            reset() {
+                this.x = Math.random() * W; this.y = Math.random() * H;
+                this.targetX = this.x; this.targetY = this.y;
+                this.type = Math.floor(Math.random() * 5);
+                this.baseSize = Math.random() * 3 + 0.5;
+                this.size = this.baseSize;
+                this.life = Math.random();
+                this.maxLife = 0.6 + Math.random() * 0.4;
+                this.speed = Math.random() * 0.8 + 0.1;
+                this.vx = (Math.random() - 0.5) * 0.4;
+                this.vy = (Math.random() - 0.5) * 0.4;
+                this.colorTier = 0;
+                this.age = 0;
+            }
+            update(dx = 0, dy = 0, isGlitching = false) {
+                // Neural Attachment: Lock to body movement
+                this.x += dx; this.y += dy;
+                this.targetX += dx; this.targetY += dy;
+
+                // Static behavior: Minimal noise, fast landing
+                this.x += (this.targetX - this.x) * 0.15;
+                this.y += (this.targetY - this.y) * 0.15;
+
+                // Futuristic Glitch: Digital Jitter
+                if (isGlitching) {
+                    if (Math.random() < 0.2) this.x += (Math.random() - 0.5) * 15;
+                    if (Math.random() < 0.05) this.y += (Math.random() - 0.5) * 5;
+                }
+
+                this.age++;
+                this.life = Math.abs(SIN_LUT[(Math.floor(this.age * this.speed * 20)) % 1024]);
+                this.size = this.baseSize * (0.6 + this.life * 0.4);
+            }
+            draw(ctx, layer) {
+                if (this.life < 0.1) return;
+
+                let opacity = this.life * 0.9;
+                let sizeMult = 1.0;
+                let blur = 0; // Disable blur for 10k particles performance
+
+                if (layer === 'BACK') {
+                    sizeMult = 0.4; opacity *= 0.3;
+                } else if (layer === 'MID') {
+                    sizeMult = 0.7; opacity *= 0.6;
+                } else if (layer === 'FRONT') {
+                    sizeMult = 1.2; opacity *= 1.0;
+                    if (this.age % 10 === 0) blur = 4; // Minimal glow for depth
+                }
+
+                ctx.globalAlpha = opacity;
+                const col = getParticleColor(this.colorTier, this.age);
+                ctx.fillStyle = col; ctx.strokeStyle = col;
+                if (blur > 0) { ctx.shadowBlur = blur; ctx.shadowColor = col; }
+                else { ctx.shadowBlur = 0; }
+
+                const s = this.size * sizeMult;
+                ctx.fillRect(this.x - s / 2, this.y - s / 2, s, s);
+                ctx.shadowBlur = 0;
+            }
+        }
+
+        const BODY_PARTICLES = Array.from({ length: 10000 }, () => new BodyParticle());
+
+        let currentHands = [];
+        let currentPose = null;
+        let currentMask = null;
+        let isActive = false;
+        let portalHold = false;
+        let sparkCooldown = 0;
+
+        const maskCv = document.createElement('canvas');
+        const mctx = maskCv.getContext('2d', { willReadFrequently: true });
+        maskCv.width = 100; maskCv.height = 100; // Efficient sampling size
+
+        function resize() {
+            W = cv.width = window.innerWidth;
+            H = cv.height = window.innerHeight;
+        }
+        resize();
+        window.addEventListener('resize', resize);
+
+        class EnergyParticle {
+            constructor(x, y, vx, vy, col) {
+                this.history = [{ x, y }];
+                this.x = x; this.y = y;
+                this.vx = vx * 0.6;
+                this.vy = vy * 0.6;
+                this.col = col;
+                this.life = 1.0;
+                this.maxHistory = 12;
+                this.size = Math.random() * 2.5 + 1;
+            }
+            update() {
+                this.x += this.vx + (Math.random() - 0.5) * 1.5;
+                this.y += this.vy + (Math.random() - 0.5) * 1.5;
+                this.history.unshift({ x: this.x, y: this.y });
+                if (this.history.length > this.maxHistory) this.history.pop();
+                this.life -= 0.025;
+            }
+            draw(ctx) {
+                this.history.forEach((pt, i) => {
+                    const t = 1 - i / this.maxHistory;
+                    ctx.globalAlpha = Math.max(0, t * this.life * 0.8);
+                    ctx.fillStyle = this.col;
+                    ctx.shadowBlur = 6 * t;
+                    ctx.shadowColor = this.col;
+                    ctx.beginPath();
+                    ctx.arc(pt.x, pt.y, this.size * t, 0, Math.PI * 2);
+                    ctx.fill();
+                });
+                ctx.globalAlpha = 1;
+                ctx.shadowBlur = 0;
+            }
+        }
+
+        class Spark {
+            constructor(x, y) {
+                this.x = x; this.y = y;
+                const ang = Math.random() * Math.PI * 2;
+                const spd = Math.random() * 6 + 3;
+                this.vx = Math.cos(ang) * spd;
+                this.vy = Math.sin(ang) * spd;
+                this.life = 1;
+                this.col = ['#ffffff', '#00ffff', '#ccffff'][Math.floor(Math.random() * 3)];
+                this.r = Math.random() * 3 + 1;
+            }
+            update() {
+                this.x += this.vx; this.y += this.vy;
+                this.vx *= 0.85; this.vy *= 0.85;
+                this.life -= 0.04;
+            }
+            draw() {
+                if (this.life <= 0) return;
+                ctx.save();
+                ctx.globalAlpha = this.life;
+                ctx.fillStyle = this.col;
+                ctx.shadowBlur = 12;
+                ctx.shadowColor = this.col;
+                ctx.beginPath(); ctx.arc(this.x, this.y, this.r, 0, Math.PI * 2); ctx.fill();
+                ctx.restore();
+            }
+        }
+
+        function triggerSparks(x, y) { for (let i = 0; i < 25; i++) sparkBurst.push(new Spark(x, y)); }
+
+        function lmScale(handLm) { return { x: (1 - handLm.x) * W, y: handLm.y * H }; }
+        function mapToPortal(normX, normY, px, py, pw, ph) { return { x: px + ((1 - normX) * pw), y: py + (normY * ph) }; }
+        function dist(a, b) { return Math.sqrt((a.x - b.x) ** 2 + (a.y - b.y) ** 2); }
+        function lerp(a, b, t) { return { x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t }; }
+
+        function expandOutward(pt, centerX, amount) {
+            const dx = pt.x - centerX;
+            return { x: pt.x + (dx === 0 ? 0 : Math.sign(dx)) * amount, y: pt.y };
+        }
+
+        const ZONE_SIZES = {
+            head: 300, chest: 600, leftArm: 300, rightArm: 300,
+            core: 400, leftLeg: 400, rightLeg: 400, feet: 300
+        };
+
+        function getAnatomicalZone(y, pose, px, py, ph) {
+            if (!pose) return 1;
+            const getPy = (idx) => py + (pose[idx].y * ph);
+            if (y < getPy(11) - 20) return 0; // head
+            if (y > getPy(23) + 40) return 5; // legs/feet
+            if (y > getPy(23) - 20) return 4; // core
+            return 1; // torso/chest
+        }
+
+        let surgeT = 0;
+
+        function drawHudNodes() {
+            const bY = H - 52;
+            const nodes = [
+                { x: 55, label: 'INPUT' }, { x: 145, label: 'DETECT' }, { x: 245, label: 'POSE' },
+                { x: 345, label: 'PORTAL' }, { x: 445, label: 'COMP' }, { x: 540, label: 'OUTPUT' },
+            ];
+            ctx.save();
+            nodes.forEach((n, i) => {
+                ctx.fillStyle = 'rgba(0,10,20,0.9)';
+                ctx.strokeStyle = `rgba(0,${180 + i * 10},255,0.6)`;
+                ctx.lineWidth = 1;
+                ctx.beginPath(); ctx.rect(n.x - 35, bY - 14, 70, 22); ctx.fill(); ctx.stroke();
+
+                ctx.fillStyle = '#00ffcc'; ctx.font = '10px Courier New'; ctx.textAlign = 'center';
+                ctx.fillText(n.label, n.x, bY + 2);
+
+                if (i > 0) {
+                    ctx.strokeStyle = 'rgba(0,180,255,0.4)';
+                    ctx.beginPath(); ctx.moveTo(nodes[i - 1].x + 35, bY - 3); ctx.lineTo(n.x - 35, bY - 3); ctx.stroke();
+                }
+                const on = portalAlpha > 0.1 && i <= Math.floor((frame * 0.1) % 6);
+                if (on) { ctx.fillStyle = `rgba(0,255,255,0.2)`; ctx.fillRect(n.x - 35, bY - 14, 70, 22); }
+            });
+
+            if (portalAlpha > 0.05 && currentHands && currentHands.length >= 2) {
+                ctx.fillStyle = '#00ffcc'; ctx.font = '9px Courier New'; ctx.textAlign = 'right';
+                ctx.fillText(`SYS.ONLINE // NEURAL_XRAY_V5`, W - 20, H - 35);
+                ctx.fillText(`PARTICLES: 5,000 // CORE: STABLE`, W - 20, H - 20);
+            }
+            ctx.restore();
+        }
+
+        function draw3DGrid(ctx, px, py, pw, ph, pose) {
+            ctx.save();
+            ctx.strokeStyle = 'rgba(0, 100, 255, 0.15)';
+            ctx.lineWidth = 0.5;
+            const hPt = pose ? pose[0] : { x: 0.5, y: 0.5 };
+            const vX = px + (1 - hPt.x) * pw;
+            const vY = py + hPt.y * ph - ph * 0.2; // Vanishing point moves with head
+
+            // Perspective lines
+            for (let i = 0; i < 15; i++) {
+                const x = px + (i / 14) * pw;
+                ctx.beginPath(); ctx.moveTo(x, py + ph); ctx.lineTo(vX, vY); ctx.stroke();
+            }
+            // Horizontal lines
+            for (let i = 0; i < 12; i++) {
+                const y = py + ph - (i / 11) * ph;
+                const scale = 1 - (i / 11) * 0.8;
+                const xL = vX + (px - vX) * scale;
+                const xR = vX + (px + pw - vX) * scale;
+                ctx.beginPath(); ctx.moveTo(xL, y); ctx.lineTo(xR, y); ctx.stroke();
+            }
+            ctx.restore();
+        }
+
+        function drawSkeletalCore(ctx, getPt) {
+            ctx.save();
+            ctx.strokeStyle = 'rgba(0, 255, 255, 0.5)';
+            ctx.lineWidth = 1.5;
+            ctx.setLineDash([4, 4]);
+
+            const sL = getPt(11), sR = getPt(12), hL = getPt(23), hR = getPt(24);
+            const spineTop = { x: (sL.x + sR.x) / 2, y: (sL.y + sR.y) / 2 };
+            const spineBottom = { x: (hL.x + hR.x) / 2, y: (hL.y + hR.y) / 2 };
+
+            // Spine
+            ctx.beginPath(); ctx.moveTo(spineTop.x, spineTop.y); ctx.lineTo(spineBottom.x, spineBottom.y); ctx.stroke();
+
+            // Ribcage (Simplified loops)
+            for (let i = 0; i < 3; i++) {
+                const y = spineTop.y + (spineBottom.y - spineTop.y) * 0.15 * (i + 1);
+                const w = (sR.x - sL.x) * (0.8 - i * 0.1);
+                ctx.beginPath(); ctx.ellipse((sL.x + sR.x) / 2, y, w * 0.6, 10, 0, 0, Math.PI * 2); ctx.stroke();
+            }
+            ctx.restore();
+        }
+
+        // MAIN DRAW LOOP
+        function drawFrame() {
+            ctx.clearRect(0, 0, W, H);
+
+            // Draw Mirrored WebCam
+            ctx.save();
+            ctx.translate(W, 0); ctx.scale(-1, 1);
+            ctx.drawImage(vid, 0, 0, W, H);
+            ctx.restore();
+
+            frame++; scanY += 0.008;
+
+            if (frame % 75 === 0 && Math.random() < 0.6) {
+                glitchUntil = frame + Math.floor(4 + Math.random() * 4);
+            }
+            const isGlitching = frame < glitchUntil;
+
+            frameEl.textContent = `FRM: ${String(frame).padStart(4, '0')} ${isGlitching ? ' [ERR]' : ''}`;
+
+            let lThumb, lIndex, rThumb, rIndex;
+            let portalActiveThisFrame = false;
+
+            if (currentHands && currentHands.length >= 2) {
+                const h0 = currentHands[0], h1 = currentHands[1];
+                const h0_idx = lmScale(h0[8]), h1_idx = lmScale(h1[8]);
+
+                let leftSideHand, rightSideHand;
+                if (h0_idx.x < h1_idx.x) { leftSideHand = h0; rightSideHand = h1; }
+                else { leftSideHand = h1; rightSideHand = h0; }
+
+                lThumb = lmScale(leftSideHand[4]); lIndex = lmScale(leftSideHand[8]);
+                rThumb = lmScale(rightSideHand[4]); rIndex = lmScale(rightSideHand[8]);
+
+                if (dist(lIndex, rIndex) < 160) {
+                    portalActiveThisFrame = true; portalHold = true; sparkCooldown--;
+                    if (sparkCooldown <= 0) {
+                        triggerSparks((lIndex.x + rIndex.x) / 2, (lIndex.y + rIndex.y) / 2);
+                        sparkCooldown = 15;
+                    }
+                } else if (portalHold) { portalActiveThisFrame = true; }
+                else { portalHold = false; }
+            } else {
+                portalHold = false;
+            }
+
+            isActive = portalActiveThisFrame;
+            portalAlpha += isActive ? 0.08 : -0.06;
+            portalAlpha = Math.max(0, Math.min(1, portalAlpha));
+
+            if (!currentHands || currentHands.length < 2) {
+                statusEl.textContent = 'STANDBY: AWAITING BOTH HANDS'; statusEl.style.color = '#0055aa';
+            } else if (!isActive) {
+                statusEl.textContent = 'DETECTED: BRING FINGERS CLOSER (~150px)'; statusEl.style.color = '#00aaff';
+            } else {
+                statusEl.textContent = '[ PORTAL FULLY ACTIVE - STRETCH HANDS ]';
+                statusEl.style.color = isGlitching ? '#ff4444' : '#00ffcc';
+                statusEl.style.textShadow = `0 0 15px ${isGlitching ? '#ff0000' : '#00ffcc'}`;
+            }
+
+            sparkBurst = sparkBurst.filter(s => s.life > 0);
+            sparkBurst.forEach(s => { s.update(); s.draw(); });
+
+            if (portalAlpha > 0.01 && lThumb && rThumb) {
+                const rawPx = Math.min(lThumb.x, lIndex.x, rThumb.x, rIndex.x);
+                const rawPy = Math.min(lThumb.y, lIndex.y, rThumb.y, rIndex.y);
+                const rawPw = Math.max(lThumb.x, lIndex.x, rThumb.x, rIndex.x) - rawPx;
+                const rawPh = Math.max(lThumb.y, lIndex.y, rThumb.y, rIndex.y) - rawPy;
+
+                const scale = 0.85;
+                const cx = rawPx + rawPw / 2;
+                const cy = rawPy + rawPh / 2;
+                const px_raw = cx - (rawPw * scale) / 2;
+                const py_raw = cy - (rawPh * scale) / 2;
+                const pw_raw = rawPw * scale;
+                const ph_raw = rawPh * scale;
+
+                // Temporal Smoothing for Portal Window
+                if (lerpPortal.w === 0) { lerpPortal = { x: px_raw, y: py_raw, w: pw_raw, h: ph_raw }; }
+                lerpPortal.x += (px_raw - lerpPortal.x) * 0.3;
+                lerpPortal.y += (py_raw - lerpPortal.y) * 0.3;
+                lerpPortal.w += (pw_raw - lerpPortal.w) * 0.3;
+                lerpPortal.h += (ph_raw - lerpPortal.h) * 0.3;
+
+                const px = lerpPortal.x;
+                const py = lerpPortal.y;
+                const pw = lerpPortal.w;
+                const ph = lerpPortal.h;
+
+                function pushOutward(pt, oX, oY, amt) { return { x: oX + (pt.x - oX) * amt, y: oY + (pt.y - oY) * amt }; }
+                const lThumbS = pushOutward(lThumb, cx, cy, scale);
+                const lIndexS = pushOutward(lIndex, cx, cy, scale);
+                const rThumbS = pushOutward(rThumb, cx, cy, scale);
+                const rIndexS = pushOutward(rIndex, cx, cy, scale);
+
+                if (pw > 15 && ph > 15) {
+                    ctx.save();
+                    ctx.globalAlpha = 1.0; // Instantly opaque portal
+
+                    ctx.beginPath();
+                    ctx.moveTo(lThumbS.x, lThumbS.y);
+                    ctx.lineTo(rThumbS.x, rThumbS.y);
+                    ctx.lineTo(rIndexS.x, rIndexS.y);
+                    ctx.lineTo(lIndexS.x, lIndexS.y);
+                    ctx.closePath();
+                    ctx.clip();
+
+                    // --- CARBON VOID OCCLUSION ---
+                    // Completely opaque solid black to hide camera
+                    ctx.fillStyle = '#000000';
+                    ctx.fillRect(px, py, pw, ph);
+
+                    // Deeper blue Depth Fog fading from center (100% opaque at edges)
+                    const vig = ctx.createRadialGradient(px + pw / 2, py + ph / 2, pw * 0.1, px + pw / 2, py + ph / 2, pw * 0.9);
+                    vig.addColorStop(0, 'rgba(0, 20, 80, 0)');
+                    vig.addColorStop(0.6, 'rgba(0, 15, 50, 0.8)');
+                    vig.addColorStop(1, 'rgba(0, 5, 20, 1)');
+                    ctx.fillStyle = vig; ctx.fillRect(px, py, pw, ph);
+
+                    // Dual-layer Grid with more vibrant cyan tint
+                    ctx.lineWidth = 1; ctx.beginPath();
+                    for (let gx = px; gx < px + pw; gx += 8) { ctx.moveTo(gx, py); ctx.lineTo(gx, py + ph); }
+                    for (let gy = py; gy < py + ph; gy += 8) { ctx.moveTo(px, gy); ctx.lineTo(px + pw, gy); }
+                    ctx.strokeStyle = 'rgba(0, 200, 255, 0.08)'; ctx.stroke();
+
+                    ctx.beginPath();
+                    for (let gx = px; gx < px + pw; gx += 40) { ctx.moveTo(gx, py); ctx.lineTo(gx, py + ph); }
+                    for (let gy = py; gy < py + ph; gy += 40) { ctx.moveTo(px, gy); ctx.lineTo(px + pw, gy); }
+                    ctx.strokeStyle = 'rgba(0,180,255,0.08)'; ctx.stroke();
+
+                    dataPackets.forEach(p => {
+                        p.xBase += p.spd;
+                        if (p.xBase > 1.2) p.xBase = -0.2;
+                        ctx.fillStyle = 'rgba(0,255,180,0.5)';
+                        ctx.fillRect(px + p.xBase * pw, py + p.yOff * ph, p.w, 1);
+                    });
+
+                    if (currentPose) {
+                        const pose = currentPose;
+                        const getPtOld = (idx) => mapToPortal(pose[idx].x, pose[idx].y, px, py, pw, ph);
+
+                        // BACKGROUND SPARKS
+                        for (let i = 0; i < 40; i++) {
+                            ctx.fillStyle = Math.random() > 0.5 ? 'rgba(255,200,100,0.8)' : 'rgba(255,255,255,0.7)';
+                            const bgS = Math.random() > 0.8 ? 3 : 1.5;
+                            ctx.fillRect(px + Math.random() * pw, py + Math.random() * ph, bgS, bgS);
+                        }
+
+                        // TOPOGRAPHIC RIPPLE ECHOES
+                        const validBody = [11, 13, 15, 23, 25, 27, 28, 26, 24, 16, 14, 12].filter(i => pose[i] && pose[i].visibility > 0.4);
+                        if (validBody.length > 2) {
+                            const pts = validBody.map(i => getPtOld(i));
+
+                            // Human Head/Neck Generator
+                            if (pose[12] && pose[11] && pose[8] && pose[7] && pose[0] && pose[8].visibility > 0.4 && pose[7].visibility > 0.4) {
+                                const rSh = getPtOld(12), lSh = getPtOld(11);
+                                const rEar = getPtOld(8), lEar = getPtOld(7), nose = getPtOld(0);
+
+                                const cX = (rEar.x + lEar.x) / 2;
+                                const earY = (rEar.y + lEar.y) / 2;
+                                const headW = Math.max(Math.abs(rEar.x - lEar.x), Math.hypot(nose.x - cX, nose.y - earY) * 2.0, 40);
+
+                                // Right Trap/Neck (up from Right Shoulder 12)
+                                pts.push({ x: rSh.x * 0.7 + cX * 0.3, y: rSh.y * 0.7 + earY * 0.3 });
+                                pts.push({ x: rEar.x - headW * 0.1, y: earY + headW * 0.5 });
+
+                                // Right Jaw/Ear
+                                pts.push({ x: rEar.x + headW * 0.1, y: rEar.y });
+
+                                // Cranium Dome (sweep over top to left)
+                                pts.push({ x: rEar.x + headW * 0.05, y: rEar.y - headW * 0.6 });
+                                pts.push({ x: cX + headW * 0.35, y: earY - headW * 0.95 });
+                                pts.push({ x: cX, y: earY - headW * 1.1 }); // Crown
+                                pts.push({ x: cX - headW * 0.35, y: earY - headW * 0.95 });
+                                pts.push({ x: lEar.x - headW * 0.05, y: lEar.y - headW * 0.6 });
+
+                                // Left Jaw/Ear
+                                pts.push({ x: lEar.x - headW * 0.1, y: lEar.y });
+
+                                // Left Neck/Trap (down to Left Shoulder 11)
+                                pts.push({ x: lEar.x + headW * 0.1, y: earY + headW * 0.5 });
+                                pts.push({ x: lSh.x * 0.7 + cX * 0.3, y: lSh.y * 0.7 + earY * 0.3 });
+                            }
+
+                            pts.push(pts[0]);
+                            const cx = pts.reduce((sum, p) => sum + p.x, 0) / pts.length;
+                            const cy = pts.reduce((sum, p) => sum + p.y, 0) / pts.length;
+
+                            const numEchoes = 8;
+                            for (let e = 1; e <= numEchoes; e++) {
+                                ctx.beginPath();
+                                pts.forEach((p, index) => {
+                                    const dx = p.x - cx; const dy = p.y - cy;
+                                    const dist = Math.hypot(dx, dy) || 1;
+                                    const amt = e * 20 + Math.sin(frame * 0.05 + e) * 8;
+                                    const extX = p.x + (dx / dist) * amt;
+                                    const extY = p.y + (dy / dist) * amt;
+                                    index === 0 ? ctx.moveTo(extX, extY) : ctx.lineTo(extX, extY);
+                                });
+                                ctx.closePath();
+                                ctx.strokeStyle = `rgba(50, 150, 255, ${0.4 - (e / numEchoes) * 0.35})`;
+                                ctx.lineWidth = e === 1 ? 2 : 1;
+                                ctx.stroke();
+                            }
+                        }
+
+                        // --- NEURAL ENERGY BODY SYSTEM ---
+                        const getPt = (idx) => mapToPortal(currentPose[idx].x, currentPose[idx].y, px, py, pw, ph);
+                        const cX = (getPt(11).x + getPt(12).x) / 2; // Chest center for surge
+                        const cY = (getPt(11).y + getPt(12).y) / 2;
+
+                        // Calculate Body Velocity (Movement Delta)
+                        if (lastChestPos.x === 0 || isNaN(lastChestPos.x)) { lastChestPos.x = cX; lastChestPos.y = cY; }
+                        bodyDelta.x = cX - lastChestPos.x;
+                        bodyDelta.y = cY - lastChestPos.y;
+                        lastChestPos.x = cX; lastChestPos.y = cY;
+
+                        // HUD Target: Floating near the head/shoulder
+                        const hTargetX = getPt(11).x - 160;
+                        const hTargetY = getPt(11).y - 40;
+                        if (hudPos.x === 0 || isNaN(hudPos.x)) { hudPos.x = hTargetX; hudPos.y = hTargetY; }
+                        hudPos.x += (hTargetX - hudPos.x) * 0.1;
+                        hudPos.y += (hTargetY - hudPos.y) * 0.1;
+
+                        // Drift Compensation: Shift ALL particles to stay attached
+                        for (let i = 0; i < 10000; i++) {
+                            const p = BODY_PARTICLES[i];
+                            p.x += bodyDelta.x; p.y += bodyDelta.y;
+                            p.targetX += bodyDelta.x; p.targetY += bodyDelta.y;
+                        }
+
+                        // 1. BUILD BODY POLYGON & HEAD ARC
+                        const hEarR = getPt(8), hEarL = getPt(7);
+                        const hWidth = dist(hEarL, hEarR) * 1.4;
+                        const hCX = (hEarL.x + hEarR.x) / 2;
+                        const hCY = (hEarL.y + hEarR.y) / 2 - hWidth * 0.6;
+
+                        const bodyPath = new Path2D();
+                        const headPoints = [];
+                        for (let i = 0; i <= 8; i++) {
+                            const ang = Math.PI + (i / 8) * Math.PI;
+                            headPoints.push({ x: hCX + Math.cos(ang) * hWidth / 2, y: hCY + Math.sin(ang) * hWidth / 1.8 });
+                        }
+
+                        const rawPoints = [
+                            hEarR, getPt(10), getPt(12), getPt(14), getPt(16),
+                            getPt(20), getPt(18), getPt(22), // Add hand specifics
+                            getPt(24), getPt(26), getPt(28), getPt(32),
+                            getPt(31), getPt(27), getPt(25), getPt(23),
+                            getPt(21), getPt(17), getPt(19), // Add hand specifics
+                            getPt(15), getPt(13), getPt(11), hEarL, getPt(9)
+                        ];
+
+                        const thickPoints = rawPoints.map((p, i) => {
+                            let amt = 25; // Default Torso
+                            if (p === hEarR || p === hEarL) amt = 8;
+                            if (i >= 2 && i <= 7) amt = 12; // Right Arm / Hand
+                            if (i >= 8 && i <= 10) amt = 18; // Right Leg
+                            if (i >= 12 && i <= 14) amt = 18; // Left Leg
+                            if (i >= 16 && i <= 21) amt = 12; // Left Arm / Hand
+                            return expandOutward(p, cX, amt);
+                        });
+
+                        bodyPath.moveTo(headPoints[0].x, headPoints[0].y);
+                        headPoints.forEach(p => bodyPath.lineTo(p.x, p.y));
+                        thickPoints.forEach(p => bodyPath.lineTo(p.x, p.y));
+                        bodyPath.closePath();
+
+                        // 2. MASK-BASED PARTICLE REDISTRIBUTION
+                        let validCoords = [];
+                        if (currentMask) {
+                            mctx.clearRect(0, 0, maskCv.width, maskCv.height);
+                            mctx.drawImage(currentMask, 0, 0, maskCv.width, maskCv.height);
+                            const imgData = mctx.getImageData(0, 0, maskCv.width, maskCv.height).data;
+                            for (let i = 0; i < imgData.length; i += 4) {
+                                if (imgData[i] > 128) { // Threshold for subject fill
+                                    const idx = i / 4;
+                                    validCoords.push({
+                                        x: (idx % maskCv.width) / maskCv.width,
+                                        y: Math.floor(idx / maskCv.width) / maskCv.height
+                                    });
+                                }
+                            }
+                        }
+
+                        // 2. PARTICLE DISTRIBUTION (Mask + Specific Head Coverage)
+                        const hTarget = getPt(0); // Nose/Head center
+
+                        for (let i = 0; i < 10000; i++) {
+                            const p = BODY_PARTICLES[i];
+
+                            // Dedicated Head Density (First 1500 particles)
+                            if (i < 1500) {
+                                if (frame % 8 === 0 || dist(p, { x: p.targetX, y: p.targetY }) < 5) {
+                                    const ang = Math.random() * Math.PI * 2;
+                                    const rad = Math.random() * (hWidth * 0.45);
+                                    p.targetX = hCX + Math.cos(ang) * rad;
+                                    p.targetY = hCY + Math.sin(ang) * rad * 1.25; // Elliptical height
+                                    p.colorTier = 0; // Head color
+                                }
+                            } else if (validCoords.length > 0) {
+                                // Body Fill
+                                if (frame % 5 === 0 || dist(p, { x: p.targetX, y: p.targetY }) < 5) {
+                                    const coord = validCoords[Math.floor(Math.random() * validCoords.length)];
+                                    const target = mapToPortal(coord.x, coord.y, px, py, pw, ph);
+                                    p.targetX = target.x; p.targetY = target.y;
+                                    p.colorTier = getAnatomicalZone(target.y, currentPose, px, py, ph);
+                                }
+                            } else {
+                                // Fallback to Torso
+                                if (frame % 20 === 0) {
+                                    p.targetX = cX + (Math.random() - 0.5) * 50;
+                                    p.targetY = cY + (Math.random() - 0.5) * 80;
+                                }
+                            }
+                        }
+
+                        // 3. RENDER LAYERS (Optimized Batch Clipping)
+                        surgeT = (frame % 180) / 180;
+                        const surgeRadius = surgeT * H * 0.8;
+
+                        ctx.save();
+                        ctx.clip(bodyPath); // GLOBAL BODY CLIP - One call = massive speedup
+
+                        ['BACK', 'MID', 'FRONT'].forEach(layer => {
+                            let start = 0, end = 3000;
+                            if (layer === 'MID') { start = 3000; end = 7000; }
+                            if (layer === 'FRONT') { start = 7000; end = 10000; }
+
+                            for (let i = start; i < end; i++) {
+                                const p = BODY_PARTICLES[i];
+                                p.update(0, 0, isGlitching);
+
+                                // Surge logic
+                                const dToC = dist(p, { x: cX, y: cY });
+                                if (Math.abs(dToC - surgeRadius) < 20) {
+                                    p.size *= 1.8; p.life = 1.0;
+                                    p.x += (p.x - cX) * 0.1; p.y += (p.y - cY) * 0.1;
+                                }
+
+                                p.draw(ctx, layer);
+                            }
+                        });
+                        ctx.restore(); // End Global Body Clip
+
+
+
+                        // 5. JOINT RING FX + ORBITING NODES
+                        const joints = [11, 12, 13, 14, 23, 24, 25, 26, 27, 28];
+                        joints.forEach(jIdx => {
+                            if (currentPose[jIdx] && currentPose[jIdx].visibility > 0.5) {
+                                const pt = getPt(jIdx);
+                                // Orbiting particles
+
+                                // Orbiting particles
+                                const orbitAngle = frame * 0.08 + jIdx * 0.7;
+                                ctx.fillStyle = 'rgba(255, 255, 255, 0.8)';
+                                for (let i = 0; i < 4; i++) {
+                                    const ox = pt.x + Math.cos(orbitAngle + i * Math.PI / 2) * 5;
+                                    const oy = pt.y + Math.sin(orbitAngle + i * Math.PI / 2) * 5;
+                                    ctx.fillRect(ox - 1, oy - 1, 2, 2);
+                                }
+                            }
+                        });
+
+                        // 5B. DATA STREAM COLUMNS
+                        ctx.fillStyle = 'rgba(0, 255, 204, 0.3)';
+                        for (let col = 0; col < 5; col++) {
+                            const colX = px + (pw / 6) * (col + 1);
+                            const riseY = py + ph - ((frame * 2 + col * 40) % ph);
+                            if (ctx.isPointInPath(bodyPath, colX, riseY)) {
+                                ctx.fillRect(colX, riseY, 1, 15);
+                            }
+                        }
+
+
+
+                        // Joints Count for HUD
+                        let vizJoints = 0;
+                        for (let i = 0; i <= 32; i++) {
+                            if (pose[i] && pose[i].visibility > 0.4) vizJoints++;
+                        }
+
+                        // FEATURE 6: LIVE DATA HUD (Neural Void Styling)
+                        ctx.save();
+                        ctx.shadowBlur = 0;
+                        ctx.fillStyle = isGlitching ? 'rgba(255,0,0,0.4)' : 'rgba(0,0,0,0.85)';
+                        ctx.strokeStyle = '#00ffff';
+                        ctx.lineWidth = 1;
+                        ctx.beginPath(); ctx.roundRect(hudPos.x, hudPos.y, 140, 90, 4); ctx.fill(); ctx.stroke();
+
+                        // Vertical "Status" Stripe
+                        ctx.fillStyle = isGlitching ? '#ff0000' : '#00ffcc';
+                        ctx.fillRect(hudPos.x, hudPos.y, 4, 90);
+
+                        // Rotating Radar Detail
+                        ctx.save();
+                        ctx.translate(hudPos.x + 125, hudPos.y + 20);
+                        ctx.rotate(frame * 0.05);
+                        ctx.strokeStyle = '#00ffff'; ctx.lineWidth = 0.5;
+                        ctx.beginPath(); ctx.moveTo(-8, 0); ctx.lineTo(8, 0); ctx.moveTo(0, -8); ctx.lineTo(0, 8); ctx.stroke();
+                        ctx.beginPath(); ctx.arc(0, 0, 6, 0, Math.PI * 2); ctx.stroke();
+                        ctx.restore();
+
+                        ctx.fillStyle = '#00ffff'; ctx.font = 'bold 9px Courier New'; ctx.textAlign = "left";
+                        ctx.fillText('► NEURAL_CORE BIOSCAN', hudPos.x + 10, hudPos.y + 15);
+                        ctx.fillText(`► NODES: ${vizJoints}/33`, hudPos.x + 10, hudPos.y + 28);
+                        ctx.fillText(`► HEX: 0x${Math.floor(Math.random() * 0xFFFF).toString(16).toUpperCase()}`, hudPos.x + 10, hudPos.y + 41);
+                        ctx.fillText(`► STABILITY: ${(98 + Math.random() * 2).toFixed(1)}%`, hudPos.x + 10, hudPos.y + 54);
+                        ctx.fillText(`► FLUX:   ${(Math.random() * 1000).toFixed(0)} GHz`, hudPos.x + 10, hudPos.y + 67);
+                        ctx.fillText(`► STATUS: [SYNCHRONIZED]`, hudPos.x + 10, hudPos.y + 80);
+
+                        // Joint Tags (Micro-Telemetry)
+                        [13, 14, 25, 26].forEach(idx => {
+                            const pt = getPt(idx);
+                            if (currentPose[idx].visibility > 0.5) {
+                                ctx.fillStyle = 'rgba(0, 255, 255, 0.4)';
+                                ctx.font = '7px Courier New';
+                                ctx.fillText(`[${idx}:${(Math.random() * 100).toFixed(0)}%]`, pt.x + 10, pt.y);
+                            }
+                        });
+
+                        ctx.restore();
+
+                        // Update stream
+                        for (let i = streamParticles.length - 1; i >= 0; i--) {
+                            let p = streamParticles[i];
+                            p.update(); p.draw(ctx);
+                            if (p.life <= 0) streamParticles.splice(i, 1);
+                        }
+                    }
+
+                    // Intense Laser Scanline
+                    const sy = py + ((scanY % 1) * ph);
+                    const sg = ctx.createLinearGradient(0, sy - 60, 0, sy);
+                    sg.addColorStop(0, 'rgba(0,255,255,0)'); sg.addColorStop(1, 'rgba(0,255,255,0.8)');
+                    ctx.fillStyle = sg; ctx.fillRect(px, Math.max(py, sy - 60), pw, sy - Math.max(py, sy - 60));
+                    ctx.fillStyle = '#ffffff'; ctx.shadowBlur = 15; ctx.shadowColor = '#00ffff';
+                    ctx.fillRect(px, sy - 2, pw, 2); ctx.shadowBlur = 0;
+
+                    // FEATURE 3: SCAN ERROR / GLITCH OVERLAY
+                    if (isGlitching) {
+                        // 3A: Horizontal Slices
+                        try {
+                            const numSlices = 3 + Math.floor(Math.random() * 4);
+                            for (let i = 0; i < numSlices; i++) {
+                                const sY = py + Math.random() * (ph - 20);
+                                const sH = 8 + Math.random() * 12;
+                                const sOff = (Math.random() - 0.5) * 80;
+                                ctx.drawImage(cv, px, sY, pw, sH, px + sOff, sY, pw, sH);
+                            }
+                        } catch (e) { } // Ignore if canvas tainted by specific cors environments
+
+                        // 3C: White Flash + Noise
+                        if (Math.random() < 0.3) {
+                            ctx.fillStyle = 'rgba(255,255,255,0.15)'; ctx.fillRect(px, py, pw, ph);
+                            ctx.fillStyle = '#fff';
+                            for (let j = 0; j < 200; j++) ctx.fillRect(px + Math.random() * pw, py + Math.random() * ph, 1, 1);
+                            ctx.fillStyle = 'rgba(255,50,50,0.9)'; ctx.font = 'bold 16px Courier M';
+                            ctx.fillText('SCAN INTERRUPT', px + pw / 2 - 60, py + ph / 2);
+                        }
+
+                        // 3D: Corrupt Text
+                        ctx.fillStyle = 'rgba(255,50,50,0.7)'; ctx.font = '10px Courier New';
+                        for (let i = 0; i < 5; i++) {
+                            const errs = ['0xFFE3 >> CORRUPT', '4A:2C:FF >> NULL', 'ERR: SEG FAULT', 'BUFFER UNDERRUN'];
+                            ctx.fillText(errs[Math.floor(Math.random() * errs.length)], px + Math.random() * (pw - 100), py + Math.random() * ph);
+                        }
+                    }
+
+                    ctx.restore();
+
+
+                    const bHue = 180 + Math.sin(frame * 0.02) * 20;
+                    [{ lw: 6, col: `hsla(${bHue}, 100%, 60%, 0.2)`, blur: 25 }, { lw: 1.5, col: `hsla(${bHue}, 100%, 60%, 0.9)`, blur: 10 }].forEach(pass => {
+                        ctx.beginPath(); ctx.moveTo(lThumbS.x, lThumbS.y); ctx.lineTo(rThumbS.x, rThumbS.y);
+                        ctx.lineTo(rIndexS.x, rIndexS.y); ctx.lineTo(lIndexS.x, lIndexS.y); ctx.closePath();
+                        ctx.lineWidth = pass.lw; ctx.strokeStyle = pass.col; ctx.shadowBlur = pass.blur;
+                        ctx.shadowColor = `hsl(${bHue}, 100%, 60%)`; ctx.stroke();
+                    });
+                    ctx.shadowBlur = 0;
+
+                    // Flat turquoise corner squares matching reference image
+                    const sq = 24;
+                    ctx.fillStyle = 'rgba(0, 255, 180, 0.8)';
+                    ctx.shadowBlur = 15; ctx.shadowColor = 'rgba(0, 255, 180, 1)';
+                    ctx.fillRect(lThumbS.x - sq / 2, lThumbS.y - sq / 2, sq, sq);
+                    ctx.fillRect(rThumbS.x - sq / 2, rThumbS.y - sq / 2, sq, sq);
+                    ctx.fillRect(rIndexS.x - sq / 2, rIndexS.y - sq / 2, sq, sq);
+                    ctx.fillRect(lIndexS.x - sq / 2, lIndexS.y - sq / 2, sq, sq);
+                    ctx.shadowBlur = 0;
+                }
+            }
+
+            drawHudNodes();
+            requestAnimationFrame(drawFrame);
+        }
+        requestAnimationFrame(drawFrame);
+
+        async function startEngines() {
+            try {
+                const holistic = new Holistic({ locateFile: f => `https://cdn.jsdelivr.net/npm/@mediapipe/holistic/${f}` });
+                holistic.setOptions({
+                    modelComplexity: 1,
+                    smoothLandmarks: true,
+                    minDetectionConfidence: 0.7,
+                    minTrackingConfidence: 0.7,
+                    enableSegmentation: true
+                });
+                holistic.onResults(res => {
+                    currentHands = [];
+                    if (res.leftHandLandmarks) currentHands.push(res.leftHandLandmarks);
+                    if (res.rightHandLandmarks) currentHands.push(res.rightHandLandmarks);
+                    currentPose = res.poseLandmarks;
+                    currentMask = res.segmentationMask;
+                });
+
+                let stream;
+                const constraints = {
+                    video: {
+                        facingMode: 'user',
+                        width: { ideal: 1280, max: 1920 },
+                        height: { ideal: 720, max: 1080 }
+                    }
+                };
+
+                try {
+                    stream = await navigator.mediaDevices.getUserMedia(constraints);
+                } catch (e) {
+                    console.error("Camera error:", e);
+                    loaderEl.innerHTML = `CAMERA ERROR: ${e.name}`;
+                    return;
+                }
+
+                vid.srcObject = stream;
+                await vid.play();
+                loaderEl.style.display = 'none';
+                statusEl.textContent = 'SYSTEM READY';
+
+                const camera = new Camera(vid, {
+                    onFrame: async () => { await holistic.send({ image: vid }); },
+                    width: 1280,
+                    height: 720
+                });
+                camera.start();
+            } catch (err) {
+                console.error("Engine Start Error:", err);
+                loaderEl.innerHTML = "ENGINE INITIALIZATION FAILED";
+            }
+        }
+        startEngines();
+    </script>
+</body>
+
+</html>
